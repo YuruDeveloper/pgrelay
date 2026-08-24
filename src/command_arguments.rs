@@ -27,11 +27,6 @@ pub(crate) struct CommandArguments {
     pub(crate) client_port: String,
     #[arg(
         long,
-        help = "The expected hostname in the TLS certificate belonging to the postgres db."
-    )]
-    pub(crate) client_validation_host: String,
-    #[arg(
-        long,
         help = "A directory path that contains all the root certificate authorities the client should trust."
     )]
     pub(crate) root_ca: String,

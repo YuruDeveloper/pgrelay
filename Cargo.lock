@@ -306,7 +306,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pgt_proxy"
+name = "pgrelay"
 version = "1.0.0"
 dependencies = [
  "anyhow",

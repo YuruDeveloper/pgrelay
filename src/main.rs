@@ -11,8 +11,24 @@ use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use tokio::io::{self, split, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio_rustls::rustls::{self, ServerConfig};
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
+
+#[derive(Clone)]
+struct TlsConfigs {
+    server: Arc<ServerConfig>,
+    client: Arc<ClientConfig>,
+}
+
+fn load_tls_configs(args: &CommandArguments) -> anyhow::Result<TlsConfigs> {
+    let server = tls_server_config::server_config(&args.certificate, &args.private_key)?;
+    let client = tls_client_config::client_config(&args.root_ca)?;
+    Ok(TlsConfigs {
+        server: Arc::new(server),
+        client: Arc::new(client),
+    })
+}
 
 // References:
 // https://postgresconf.org/system/events/document/000/000/183/pgconf_us_v4.pdf
@@ -29,40 +45,83 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 async fn main() -> anyhow::Result<()> {
     let args: CommandArguments = CommandArguments::parse();
 
-    let tls_server_config =
-        tls_server_config::server_config(&args.certificate, &args.private_key)?;
-    let tls_client_config = tls_client_config::client_config(&args.root_ca)?;
+    let initial_tls_configs = load_tls_configs(&args)?;
+    let (tls_configs_tx, tls_configs_rx) = watch::channel(initial_tls_configs);
+
+    spawn_reload_on_sighup(args.clone(), tls_configs_tx)?;
 
     let listener = TcpListener::bind(format!("0.0.0.0:{}", &args.server_port)).await?;
-    while let Ok((inbound_tcp_stream, _)) = listener.accept().await {
-        tokio::spawn(handle_inbound_request(
-            inbound_tcp_stream,
-            tls_server_config.clone(),
-            tls_client_config.clone(),
-            args.client_host.to_owned(),
-            args.client_port.to_owned(),
-            args.client_validation_host.to_owned(),
-        ));
+    eprintln!("pgrelay: listening on 0.0.0.0:{}", &args.server_port);
+    while let Ok((inbound_tcp_stream, peer_addr)) = listener.accept().await {
+        let tls_configs = tls_configs_rx.borrow().clone();
+        let client_host = args.client_host.to_owned();
+        let client_port = args.client_port.to_owned();
+        tokio::spawn(async move {
+            if let Err(err) =
+                handle_inbound_request(inbound_tcp_stream, tls_configs, client_host, client_port)
+                    .await
+            {
+                eprintln!("pgrelay: connection from {peer_addr} failed: {err:#}");
+            }
+        });
     }
 
     bail!("Something went wrong with the listener! Exiting program.")
 }
 
+// SIGHUP is intercepted here so it triggers a certificate/root-CA reload
+// instead of the default action (terminate the process). A failed reload is
+// logged and the previous, still-valid configuration keeps serving.
+#[cfg(unix)]
+fn spawn_reload_on_sighup(
+    args: CommandArguments,
+    tls_configs_tx: watch::Sender<TlsConfigs>,
+) -> anyhow::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sighup = signal(SignalKind::hangup())?;
+    tokio::spawn(async move {
+        loop {
+            if sighup.recv().await.is_none() {
+                break;
+            }
+            match load_tls_configs(&args) {
+                Ok(new_configs) => {
+                    let _ = tls_configs_tx.send(new_configs);
+                    eprintln!("pgrelay: SIGHUP received, certificates reloaded");
+                }
+                Err(err) => {
+                    eprintln!(
+                        "pgrelay: SIGHUP received, reload failed, keeping previous certificates: {err:#}"
+                    );
+                }
+            }
+        }
+    });
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn spawn_reload_on_sighup(
+    _args: CommandArguments,
+    _tls_configs_tx: watch::Sender<TlsConfigs>,
+) -> anyhow::Result<()> {
+    Ok(())
+}
+
 async fn handle_inbound_request(
     inbound_stream: TcpStream,
-    server_config: ServerConfig,
-    client_config: ClientConfig,
+    tls_configs: TlsConfigs,
     connection_host_or_ip: String,
     connection_port: String,
-    tls_validation_host: String,
 ) -> anyhow::Result<()> {
-    let inbound_tls_stream = inbound_handshake(inbound_stream, server_config).await?;
+    let inbound_tls_stream = inbound_handshake(inbound_stream, tls_configs.server).await?;
 
     let outbound_tls_stream = outbound_handshake(
         &connection_host_or_ip,
         &connection_port,
-        client_config,
-        &tls_validation_host,
+        tls_configs.client,
     )
     .await?;
 
@@ -73,7 +132,7 @@ async fn handle_inbound_request(
 
 async fn inbound_handshake(
     mut inbound_stream: TcpStream,
-    server_config: ServerConfig,
+    server_config: Arc<ServerConfig>,
 ) -> anyhow::Result<TlsStream<TcpStream>> {
     let mut buffer = [0u8; 8];
     inbound_stream.read_exact(&mut buffer).await?;
@@ -85,7 +144,7 @@ async fn inbound_handshake(
     // tell pgClient we're proceeding with TLS
     inbound_stream.write_all(b"S").await?;
 
-    let stream = TlsAcceptor::from(Arc::new(server_config))
+    let stream = TlsAcceptor::from(server_config)
         .accept(inbound_stream)
         .await?
         .into();
@@ -96,8 +155,7 @@ async fn inbound_handshake(
 async fn outbound_handshake(
     connection_host_or_ip: &str,
     connection_port: &str,
-    client_config: ClientConfig,
-    tls_validation_host: &str,
+    client_config: Arc<ClientConfig>,
 ) -> anyhow::Result<TlsStream<TcpStream>> {
     let connect_to = format!("{}:{}", connection_host_or_ip, connection_port);
     let connect_to = connect_to
@@ -115,11 +173,14 @@ async fn outbound_handshake(
         bail!("TLS not supported by PG server on outbound connection");
     }
 
-    let stream = TlsConnector::from(Arc::new(client_config))
+    // The hostname carried here is never checked (see ChainOnlyVerifier in
+    // tls_client_config.rs) — only chain-of-trust is verified — so any valid
+    // ServerName satisfies the TlsConnector::connect API.
+    let stream = TlsConnector::from(client_config)
         .connect(
-            ServerName::DnsName(tls_validation_host.to_owned().try_into()?),
+            ServerName::try_from(connection_host_or_ip.to_owned())?,
             outbound_stream,
-        ) // tls verification for pgServer happens here
+        )
         .await?
         .into();
 
